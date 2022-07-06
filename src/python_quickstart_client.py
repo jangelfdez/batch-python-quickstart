@@ -28,6 +28,8 @@
 Create a pool of nodes to output text files from azure blob storage.
 """
 
+from urllib3.exceptions import InsecureRequestWarning
+import requests
 import datetime
 import io
 import os
@@ -43,6 +45,12 @@ from azure.batch import BatchServiceClient
 from azure.batch.batch_auth import SharedKeyCredentials
 import azure.batch.models as batchmodels
 from azure.core.exceptions import ResourceExistsError
+
+from azure.identity import AzureCliCredential
+from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.storage import StorageManagementClient
+
+from azure.mgmt.batch import BatchManagementClient
 
 import config
 
@@ -107,7 +115,7 @@ def print_batch_exception(batch_exception: batchmodels.BatchErrorException):
 
 
 def upload_file_to_container(blob_storage_service_client: BlobServiceClient,
-                             container_name: str, file_path: str) -> batchmodels.ResourceFile:
+                             container_name: str, file_path: str, account_key) -> batchmodels.ResourceFile:
     """
     Uploads a local file to an Azure Blob storage container.
 
@@ -118,7 +126,8 @@ def upload_file_to_container(blob_storage_service_client: BlobServiceClient,
     tasks.
     """
     blob_name = os.path.basename(file_path)
-    blob_client = blob_storage_service_client.get_blob_client(container_name, blob_name)
+    blob_client = blob_storage_service_client.get_blob_client(
+        container_name, blob_name)
 
     print(f'Uploading file {file_path} to container [{container_name}]...')
 
@@ -129,7 +138,7 @@ def upload_file_to_container(blob_storage_service_client: BlobServiceClient,
         config.STORAGE_ACCOUNT_NAME,
         container_name,
         blob_name,
-        account_key=config.STORAGE_ACCOUNT_KEY,
+        account_key=account_key,
         permission=BlobSasPermissions(read=True),
         expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
     )
@@ -161,6 +170,98 @@ def generate_sas_url(
     return f"https://{account_name}.{account_domain}/{container_name}/{blob_name}?{sas_token}"
 
 
+def create_resource_group(resource_client: ResourceManagementClient):
+
+    RESOURCE_GROUP_NAME = config.RESOURCE_GROUP_NAME
+    LOCATION = config.LOCATION
+    print(f"Provisioning resource group {RESOURCE_GROUP_NAME}")
+
+    rg_result = resource_client.resource_groups.create_or_update(RESOURCE_GROUP_NAME,
+                                                                 {"location": LOCATION})
+
+
+def create_storage_account(credential, subscription_id):
+    # Constants we need in multiple places: the resource group name and the region
+    # in which we provision resources. You can change these values however you want.
+    RESOURCE_GROUP_NAME = config.RESOURCE_GROUP_NAME
+    LOCATION = config.LOCATION
+
+    # Step 1: Provision the storage account, starting with a management object.
+
+    storage_client = StorageManagementClient(credential, subscription_id)
+
+    # This example uses the CLI profile credentials because we assume the script
+    # is being used to provision the resource in the same way the Azure CLI would be used.
+    STORAGE_ACCOUNT_NAME = config.STORAGE_ACCOUNT_NAME
+
+    # Check if the account name is available. Storage account names must be unique across
+    # Azure because they're used in URLs.
+    availability_result = storage_client.storage_accounts.check_name_availability(
+        {"name": STORAGE_ACCOUNT_NAME}
+    )
+
+    if not availability_result.name_available:
+        print(
+            f"Storage name {STORAGE_ACCOUNT_NAME} is already in use. Trying to deploy it although it could fail.")
+
+    # The name is available, so provision the account
+    print(f"Provisioning storage account {STORAGE_ACCOUNT_NAME}")
+    poller = storage_client.storage_accounts.begin_create(RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME,
+                                                          {
+                                                              "location": LOCATION,
+                                                              "kind": "StorageV2",
+                                                              "sku": {"name": "Standard_LRS"}
+                                                          }
+                                                          )
+
+    # Long-running operations return a poller object; calling poller.result()
+    # waits for completion.
+    account_result = poller.result()
+    print(f"Provisioned storage account {STORAGE_ACCOUNT_NAME}")
+
+    # Step 2: Retrieve the account's primary access key and generate a connection string.
+    keys = storage_client.storage_accounts.list_keys(
+        RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME)
+
+    return keys.keys[0].value
+
+
+def create_batch_account(credential, subscription_id):
+    # Constants we need in multiple places: the resource group name and the region
+    # in which we provision resources. You can change these values however you want.
+    RESOURCE_GROUP_NAME = config.RESOURCE_GROUP_NAME
+    LOCATION = config.LOCATION
+
+    # Step 1: Provision the batch account, starting with a management object.
+
+    batch_client = BatchManagementClient(credential, subscription_id)
+
+    # This example uses the CLI profile credentials because we assume the script
+    # is being used to provision the resource in the same way the Azure CLI would be used.
+    BATCH_ACCOUNT_NAME = config.BATCH_ACCOUNT_NAME
+
+    # The name is available, so provision the account
+    print(f"Provisioning batch account {BATCH_ACCOUNT_NAME}")
+    poller = batch_client.batch_account.begin_create(RESOURCE_GROUP_NAME, BATCH_ACCOUNT_NAME,
+                                                     {
+                                                         "location": LOCATION
+                                                     }
+                                                     )
+
+    # Long-running operations return a poller object; calling poller.result()
+    # waits for completion.
+    account_result = poller.result()
+    print(f"Provisioned batch account {account_result.name}")
+
+    # Step 2: Retrieve the account's primary access key and its endpoint
+    keys = batch_client.batch_account.get_keys(
+        RESOURCE_GROUP_NAME, BATCH_ACCOUNT_NAME)
+
+    endpoint = account_result.account_endpoint
+
+    return (keys.primary, endpoint)
+
+
 def create_pool(batch_service_client: BatchServiceClient, pool_id: str):
     """
     Creates a pool of compute nodes with the specified OS settings.
@@ -181,14 +282,15 @@ def create_pool(batch_service_client: BatchServiceClient, pool_id: str):
         id=pool_id,
         virtual_machine_configuration=batchmodels.VirtualMachineConfiguration(
             image_reference=batchmodels.ImageReference(
-                publisher="canonical",
-                offer="0001-com-ubuntu-server-focal",
-                sku="20_04-lts",
+                publisher="MicrosoftWindowsServer",
+                offer="WindowsServer",
+                sku="2012-R2-Datacenter",
                 version="latest"
             ),
-            node_agent_sku_id="batch.node.ubuntu 20.04"),
+            node_agent_sku_id="batch.node.windows amd64"),
         vm_size=config.POOL_VM_SIZE,
-        target_dedicated_nodes=config.POOL_NODE_COUNT
+        #target_dedicated_nodes=config.POOL_NODE_COUNT
+        target_low_priority_nodes=config.POOL_NODE_COUNT
     )
     batch_service_client.pool.add(new_pool)
 
@@ -226,7 +328,7 @@ def add_tasks(batch_service_client: BatchServiceClient, job_id: str, resource_in
 
     for idx, input_file in enumerate(resource_input_files):
 
-        command = f"/bin/bash -c \"cat {input_file.file_path}\""
+        command = f"cmd /c \"type {input_file.file_path}\""
         tasks.append(batchmodels.TaskAddParameter(
             id=f'Task{idx}',
             command_line=command,
@@ -250,7 +352,8 @@ def wait_for_tasks_to_complete(batch_service_client: BatchServiceClient, job_id:
     """
     timeout_expiration = datetime.datetime.now() + timeout
 
-    print(f"Monitoring all tasks for 'Completed' state, timeout in {timeout}...", end='')
+    print(
+        f"Monitoring all tasks for 'Completed' state, timeout in {timeout}...", end='')
 
     while datetime.datetime.now() < timeout_expiration:
         print('.', end='')
@@ -271,7 +374,7 @@ def wait_for_tasks_to_complete(batch_service_client: BatchServiceClient, job_id:
 
 
 def print_task_output(batch_service_client: BatchServiceClient, job_id: str,
-                      text_encoding: str=None):
+                      text_encoding: str = None):
     """
     Prints the stdout.txt file for each task in the job.
 
@@ -300,8 +403,10 @@ def print_task_output(batch_service_client: BatchServiceClient, job_id: str,
         if text_encoding is None:
             text_encoding = DEFAULT_ENCODING
 
-        sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding = text_encoding)
-        sys.stderr = io.TextIOWrapper(sys.stderr.detach(), encoding = text_encoding)
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.detach(), encoding=text_encoding)
+        sys.stderr = io.TextIOWrapper(
+            sys.stderr.detach(), encoding=text_encoding)
 
         print("Standard output:")
         print(file_text)
@@ -332,11 +437,37 @@ if __name__ == '__main__':
     print(f'Sample start: {start_time}')
     print()
 
+    # Suppress only the single warning from urllib3 needed.
+    requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+    # Acquire a credential object using CLI-based authentication.
+    credential = AzureCliCredential()
+
+    # Retrieve subscription ID from environment variable.
+    subscription_id = config.AZURE_SUBSCRIPTION_ID
+
+    # Create the Azure Resource Manager client, for use in the creation
+    # process of the required Azure services.
+    resource_client = ResourceManagementClient(credential, subscription_id)
+
+    # Create the resource group will contain all Azure resources used
+    # in this demo
+    create_resource_group(resource_client)
+
+    # Create the storage account where Azure Batch resources would be
+    # uploaded
+    (batch_account_key, batch_account_endpoint) = create_batch_account(
+        credential, subscription_id)
+
+    # Create the storage account where Azure Batch resources would be
+    # uploaded
+    storage_account_key = create_storage_account(credential, subscription_id)
+
     # Create the blob client, for use in obtaining references to
     # blob storage containers and uploading files to containers.
     blob_service_client = BlobServiceClient(
         account_url=f"https://{config.STORAGE_ACCOUNT_NAME}.{config.STORAGE_ACCOUNT_DOMAIN}/",
-        credential=config.STORAGE_ACCOUNT_KEY
+        credential=storage_account_key
     )
 
     # Use the blob client to create the containers in Azure Storage if they
@@ -354,21 +485,21 @@ if __name__ == '__main__':
 
     # Upload the data files.
     input_files = [
-        upload_file_to_container(blob_service_client, input_container_name, file_path)
+        upload_file_to_container(
+            blob_service_client, input_container_name, file_path, storage_account_key)
         for file_path in input_file_paths]
 
     # Create a Batch service client. We'll now be interacting with the Batch
     # service in addition to Storage
     credentials = SharedKeyCredentials(config.BATCH_ACCOUNT_NAME,
-        config.BATCH_ACCOUNT_KEY)
+                                       batch_account_key)
 
     batch_client = BatchServiceClient(
         credentials,
-        batch_url=config.BATCH_ACCOUNT_URL)
+        batch_url="https://" + batch_account_endpoint)
 
     try:
-        # Create the pool that will contain the compute nodes that will execute the
-        # tasks.
+
         create_pool(batch_client, config.POOL_ID)
 
         # Create the job that will run the tasks.
@@ -380,9 +511,9 @@ if __name__ == '__main__':
         # Pause execution until tasks reach Completed state.
         wait_for_tasks_to_complete(batch_client,
                                    config.JOB_ID,
-                                   datetime.timedelta(minutes=30))
+                                   datetime.timedelta(minutes=5))
 
-        print("  Success! All tasks reached the 'Completed' state within the "
+        print(" Success! All tasks reached the 'Completed' state within the "
               "specified timeout period.")
 
         # Print the stdout.txt and stderr.txt files for each task to the console
@@ -412,4 +543,3 @@ if __name__ == '__main__':
 
         if query_yes_no('Delete pool?') == 'yes':
             batch_client.pool.delete(config.POOL_ID)
- 

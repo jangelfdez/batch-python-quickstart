@@ -21,15 +21,18 @@
 Configure Batch and Storage Account credentials
 """
 
-BATCH_ACCOUNT_NAME = ''  # Your batch account name
-BATCH_ACCOUNT_KEY = ''  # Your batch account key
-BATCH_ACCOUNT_URL = ''  # Your batch account URL
+RESOURCE_GROUP_NAME = ""
+LOCATION = ""
+AZURE_SUBSCRIPTION_ID = ""
+
 STORAGE_ACCOUNT_NAME = ''
-STORAGE_ACCOUNT_KEY = ''
+STORAGE_ACCOUNT_CONTAINER_NAME= ''
 STORAGE_ACCOUNT_DOMAIN = 'blob.core.windows.net' # Your storage account blob service domain
 
-POOL_ID = 'PythonQuickstartPool'  # Your Pool ID
-POOL_NODE_COUNT = 2  # Pool node count
-POOL_VM_SIZE = 'STANDARD_DS1_V2'  # VM Type/Size
-JOB_ID = 'PythonQuickstartJob'  # Job ID
+BATCH_ACCOUNT_NAME = ''  # Your batch account name
+
+POOL_ID = 'Pool'  # Your Pool ID
+POOL_NODE_COUNT = 1  # Pool node count
+POOL_VM_SIZE = 'Standard_HB120-64rs_v3'  # VM Type/Size
+JOB_ID = 'Job'  # Job ID
 STANDARD_OUT_FILE_NAME = 'stdout.txt'  # Standard Output file
